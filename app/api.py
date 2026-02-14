@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, model_validator
 from .chunking import chunk_documents
 from .config import get_settings
 from .miner import mine_documents
+from .reasoning import compose_answer, decompose_question
 
 app = FastAPI(title="Scientific Search API", version="0.1.0")
 
@@ -71,6 +72,33 @@ class QueryResponse(BaseModel):
     results: List[QueryResult]
 
 
+class AnswerRequest(BaseModel):
+    question: str = Field(..., min_length=3)
+    max_substeps: int = Field(default=4, ge=1, le=8)
+    top_k_per_step: int = Field(default=3, ge=1, le=10)
+
+
+class AnswerStep(BaseModel):
+    sub_question: str
+    results: List[QueryResult]
+
+
+class Citation(BaseModel):
+    chunk_id: str
+    doc_id: str
+    title: str
+    url: str
+    score: float
+
+
+class AnswerResponse(BaseModel):
+    question: str
+    sub_questions: List[str]
+    steps: List[AnswerStep]
+    answer: str
+    citations: List[Citation]
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -130,3 +158,57 @@ def query(payload: QueryRequest) -> QueryResponse:
 
     normalized = [QueryResult(**item) for item in results]
     return QueryResponse(query=payload.query, top_k=payload.top_k, results=normalized)
+
+
+@app.post("/answer", response_model=AnswerResponse)
+def answer(payload: AnswerRequest) -> AnswerResponse:
+    try:
+        settings = get_settings()
+        vector_store_class = get_vector_store_class()
+        store = vector_store_class.load(settings.vector_store_dir)
+
+        sub_questions = decompose_question(payload.question, max_steps=payload.max_substeps)
+        if not sub_questions:
+            sub_questions = [payload.question]
+
+        raw_steps = []
+        for sub_question in sub_questions:
+            results = store.search(sub_question, top_k=payload.top_k_per_step)
+            normalized = [QueryResult(**item) for item in results]
+            raw_steps.append({"sub_question": sub_question, "results": normalized})
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Vector store not found.") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to answer question: {exc}") from exc
+
+    answer_text = compose_answer(
+        payload.question,
+        [
+            {
+                "sub_question": step["sub_question"],
+                "results": [item.model_dump() for item in step["results"]],
+            }
+            for step in raw_steps
+        ],
+    )
+
+    citation_map: dict[str, Citation] = {}
+    for step in raw_steps:
+        for result in step["results"]:
+            if result.chunk_id in citation_map:
+                continue
+            citation_map[result.chunk_id] = Citation(
+                chunk_id=result.chunk_id,
+                doc_id=result.doc_id,
+                title=result.title,
+                url=result.url,
+                score=result.score,
+            )
+
+    return AnswerResponse(
+        question=payload.question,
+        sub_questions=sub_questions,
+        steps=[AnswerStep(sub_question=step["sub_question"], results=step["results"]) for step in raw_steps],
+        answer=answer_text,
+        citations=list(citation_map.values()),
+    )

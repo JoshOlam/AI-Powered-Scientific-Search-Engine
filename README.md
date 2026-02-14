@@ -26,7 +26,33 @@ flowchart LR
     J --> K[Top-K Relevant Chunks + Sources]
 ```
 
-![alt text](assets/imgs/image.png)
+![System Design](assets/imgs/image.png)
+
+## Complex Question Flow
+
+For multi-part questions, the API runs a retrieval-composition flow:
+
+```mermaid
+flowchart LR
+    A["User Complex Question"] --> B["Question Decomposer"]
+    B --> C["Sub-question 1"]
+    B --> D["Sub-question 2"]
+    B --> E["Sub-question N"]
+    C --> F["Vector Retrieval"]
+    D --> F
+    E --> F
+    F --> G["Evidence Aggregator + Citation Dedup"]
+    G --> H["Grounded Final Answer"]
+```
+
+![multi-part questions](assets/imgs/multipart-question-flow-image.png)
+
+The `/answer` endpoint returns:
+
+- `sub_questions`: the decomposition output
+- `steps`: retrieval results for each sub-question
+- `answer`: composed, evidence-grounded synthesis
+- `citations`: de-duplicated evidence references
 
 ## Why this design
 
@@ -155,6 +181,18 @@ curl -X POST http://127.0.0.1:8000/query \
   -d '{
     "query": "Which papers discuss LLM-based molecule generation?",
     "top_k": 5
+  }'
+```
+
+## Ask Complex Questions (HTTP)
+
+```bash
+curl -X POST http://127.0.0.1:8000/answer \
+  -H "Content-Type: application/json" \
+  -d '{
+    "question": "What are the dangerous medical conditions and what risk factors are mentioned?",
+    "max_substeps": 4,
+    "top_k_per_step": 3
   }'
 ```
 
