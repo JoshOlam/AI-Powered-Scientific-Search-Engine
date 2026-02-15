@@ -1,16 +1,29 @@
 from __future__ import annotations
 
+import logging
+import time
+from uuid import uuid4
 from typing import List
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel, Field, model_validator
 
 from .chunking import chunk_documents
 from .config import get_settings
+from .logging_utils import RequestLoggerAdapter, configure_logging
 from .miner import mine_documents
 from .reasoning import compose_answer, decompose_question
+from .tracing import get_trace_client
 
-app = FastAPI(title="Scientific Search API", version="0.1.0")
+initial_settings = get_settings()
+configure_logging(initial_settings.log_level)
+logger = RequestLoggerAdapter(logging.getLogger(__name__), {})
+trace_client = get_trace_client()
+
+app = FastAPI(title=initial_settings.app_name, version=initial_settings.app_version)
 
 
 def get_vector_store_class():
@@ -74,8 +87,8 @@ class QueryResponse(BaseModel):
 
 class AnswerRequest(BaseModel):
     question: str = Field(..., min_length=3)
-    max_substeps: int = Field(default=4, ge=1, le=8)
-    top_k_per_step: int = Field(default=3, ge=1, le=10)
+    max_substeps: int | None = Field(default=None, ge=1, le=8)
+    top_k_per_step: int | None = Field(default=None, ge=1, le=10)
 
 
 class AnswerStep(BaseModel):
@@ -99,33 +112,125 @@ class AnswerResponse(BaseModel):
     citations: List[Citation]
 
 
+class ErrorResponse(BaseModel):
+    code: str
+    message: str
+    request_id: str
+
+
+class RequestContextMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        request_id = request.headers.get("x-request-id", str(uuid4()))
+        request.state.request_id = request_id
+        started = time.perf_counter()
+
+        response = await call_next(request)
+        duration_ms = round((time.perf_counter() - started) * 1000, 2)
+        response.headers["x-request-id"] = request_id
+
+        logger.info(
+            "request.completed",
+            extra={
+                "request_id": request_id,
+                "path": request.url.path,
+                "method": request.method,
+                "status_code": response.status_code,
+                "duration_ms": duration_ms,
+            },
+        )
+        return response
+
+
+app.add_middleware(RequestContextMiddleware)
+
+
+def _request_id(request: Request) -> str:
+    return getattr(request.state, "request_id", "unknown")
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    req_id = _request_id(request)
+    logger.warning(
+        "request.http_error",
+        extra={
+            "request_id": req_id,
+            "path": request.url.path,
+            "method": request.method,
+            "status_code": exc.status_code,
+        },
+    )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=ErrorResponse(code="http_error", message=str(exc.detail), request_id=req_id).model_dump(),
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    req_id = _request_id(request)
+    logger.warning(
+        "request.validation_error",
+        extra={"request_id": req_id, "path": request.url.path, "method": request.method, "status_code": 422},
+    )
+    return JSONResponse(
+        status_code=422,
+        content=ErrorResponse(code="validation_error", message="Invalid request payload.", request_id=req_id).model_dump(),
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    req_id = _request_id(request)
+    logger.exception(
+        "request.unhandled_error",
+        extra={"request_id": req_id, "path": request.url.path, "method": request.method, "status_code": 500},
+    )
+    return JSONResponse(
+        status_code=500,
+        content=ErrorResponse(code="internal_error", message="Internal server error.", request_id=req_id).model_dump(),
+    )
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
 
 
+@app.get("/ready")
+def ready() -> dict:
+    settings = get_settings()
+    vector_store_class = get_vector_store_class()
+    try:
+        vector_store_class.load(settings.vector_store_dir)
+        return {"status": "ready", "vector_store_dir": settings.vector_store_dir}
+    except Exception:
+        return {"status": "not_ready", "vector_store_dir": settings.vector_store_dir}
+
+
 @app.post("/build-index", response_model=BuildIndexResponse)
 def build_index(payload: BuildIndexRequest) -> BuildIndexResponse:
+    settings = get_settings()
     try:
-        settings = get_settings()
         vector_store_class = get_vector_store_class()
         docs = mine_documents(
             topic=payload.topic,
             arxiv_docs=payload.arxiv_docs,
             pubmed_docs=payload.pubmed_docs,
+            timeout=settings.request_timeout_seconds,
         )
         chunks = chunk_documents(
             docs,
             max_chars=payload.chunk_size,
             overlap_sentences=payload.chunk_overlap,
         )
-        store = vector_store_class()
+        store = vector_store_class(model_name=settings.embedding_model_name)
         store.build(chunks)
         store.save(settings.vector_store_dir)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to build index: {exc}") from exc
 
-    return BuildIndexResponse(
+    response = BuildIndexResponse(
         topic=payload.topic,
         mined_documents=len(docs),
         chunks=len(chunks),
@@ -142,12 +247,19 @@ def build_index(payload: BuildIndexRequest) -> BuildIndexResponse:
             for doc in docs
         ],
     )
+    trace_client.capture(
+        name="build-index",
+        input_payload=payload.model_dump(),
+        output_payload={"mined_documents": response.mined_documents, "chunks": response.chunks},
+        metadata={"vector_store_dir": settings.vector_store_dir},
+    )
+    return response
 
 
 @app.post("/query", response_model=QueryResponse)
 def query(payload: QueryRequest) -> QueryResponse:
+    settings = get_settings()
     try:
-        settings = get_settings()
         vector_store_class = get_vector_store_class()
         store = vector_store_class.load(settings.vector_store_dir)
         results = store.search(payload.query, top_k=payload.top_k)
@@ -157,23 +269,32 @@ def query(payload: QueryRequest) -> QueryResponse:
         raise HTTPException(status_code=500, detail=f"Failed to query index: {exc}") from exc
 
     normalized = [QueryResult(**item) for item in results]
-    return QueryResponse(query=payload.query, top_k=payload.top_k, results=normalized)
+    response = QueryResponse(query=payload.query, top_k=payload.top_k, results=normalized)
+    trace_client.capture(
+        name="query",
+        input_payload=payload.model_dump(),
+        output_payload={"results_count": len(response.results)},
+        metadata={"vector_store_dir": settings.vector_store_dir},
+    )
+    return response
 
 
 @app.post("/answer", response_model=AnswerResponse)
 def answer(payload: AnswerRequest) -> AnswerResponse:
+    settings = get_settings()
+    max_substeps = payload.max_substeps or settings.answer_max_substeps_default
+    top_k_per_step = payload.top_k_per_step or settings.answer_top_k_per_step_default
     try:
-        settings = get_settings()
         vector_store_class = get_vector_store_class()
         store = vector_store_class.load(settings.vector_store_dir)
 
-        sub_questions = decompose_question(payload.question, max_steps=payload.max_substeps)
+        sub_questions = decompose_question(payload.question, max_steps=max_substeps)
         if not sub_questions:
             sub_questions = [payload.question]
 
         raw_steps = []
         for sub_question in sub_questions:
-            results = store.search(sub_question, top_k=payload.top_k_per_step)
+            results = store.search(sub_question, top_k=top_k_per_step)
             normalized = [QueryResult(**item) for item in results]
             raw_steps.append({"sub_question": sub_question, "results": normalized})
     except FileNotFoundError as exc:
@@ -205,10 +326,20 @@ def answer(payload: AnswerRequest) -> AnswerResponse:
                 score=result.score,
             )
 
-    return AnswerResponse(
+    response = AnswerResponse(
         question=payload.question,
         sub_questions=sub_questions,
         steps=[AnswerStep(sub_question=step["sub_question"], results=step["results"]) for step in raw_steps],
         answer=answer_text,
         citations=list(citation_map.values()),
     )
+    trace_client.capture(
+        name="answer",
+        input_payload=payload.model_dump(),
+        output_payload={
+            "sub_questions": response.sub_questions,
+            "citations_count": len(response.citations),
+        },
+        metadata={"vector_store_dir": settings.vector_store_dir},
+    )
+    return response
