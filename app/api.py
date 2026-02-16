@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from .chunking import chunk_documents
 from .config import get_settings
+from .evaluation import evaluate_answer_quality
 from .logging_utils import RequestLoggerAdapter, configure_logging
 from .miner import mine_documents
 from .reasoning import compose_answer, decompose_question
@@ -109,6 +110,29 @@ class AnswerResponse(BaseModel):
     sub_questions: List[str]
     steps: List[AnswerStep]
     answer: str
+    citations: List[Citation]
+
+
+class EvaluateRequest(BaseModel):
+    question: str = Field(..., min_length=3)
+    reference_answer: str = Field(..., min_length=3)
+    required_facts: List[str] = Field(default_factory=list)
+    expected_doc_ids: List[str] = Field(default_factory=list)
+    max_substeps: int | None = Field(default=None, ge=1, le=8)
+    top_k_per_step: int | None = Field(default=None, ge=1, le=10)
+
+
+class EvaluateResponse(BaseModel):
+    question: str
+    answer: str
+    sub_questions: List[str]
+    overall_score: float
+    correctness_score: float
+    faithfulness_score: float
+    fact_coverage_score: float
+    citation_recall_score: float
+    missing_facts: List[str]
+    unsupported_sentences: List[str]
     citations: List[Citation]
 
 
@@ -339,6 +363,95 @@ def answer(payload: AnswerRequest) -> AnswerResponse:
         output_payload={
             "sub_questions": response.sub_questions,
             "citations_count": len(response.citations),
+        },
+        metadata={"vector_store_dir": settings.vector_store_dir},
+    )
+    return response
+
+
+@app.post("/evaluate", response_model=EvaluateResponse)
+def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
+    settings = get_settings()
+    max_substeps = payload.max_substeps or settings.answer_max_substeps_default
+    top_k_per_step = payload.top_k_per_step or settings.answer_top_k_per_step_default
+
+    try:
+        vector_store_class = get_vector_store_class()
+        store = vector_store_class.load(settings.vector_store_dir)
+
+        sub_questions = decompose_question(payload.question, max_steps=max_substeps)
+        if not sub_questions:
+            sub_questions = [payload.question]
+
+        raw_steps = []
+        for sub_question in sub_questions:
+            results = store.search(sub_question, top_k=top_k_per_step)
+            normalized = [QueryResult(**item) for item in results]
+            raw_steps.append({"sub_question": sub_question, "results": normalized})
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Vector store not found.") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to evaluate answer: {exc}") from exc
+
+    answer_text = compose_answer(
+        payload.question,
+        [
+            {
+                "sub_question": step["sub_question"],
+                "results": [item.model_dump() for item in step["results"]],
+            }
+            for step in raw_steps
+        ],
+    )
+
+    citation_map: dict[str, Citation] = {}
+    evidence_texts: List[str] = []
+    cited_doc_ids: List[str] = []
+    for step in raw_steps:
+        for result in step["results"]:
+            evidence_texts.append(result.text)
+            cited_doc_ids.append(result.doc_id)
+            if result.chunk_id in citation_map:
+                continue
+            citation_map[result.chunk_id] = Citation(
+                chunk_id=result.chunk_id,
+                doc_id=result.doc_id,
+                title=result.title,
+                url=result.url,
+                score=result.score,
+            )
+
+    metrics = evaluate_answer_quality(
+        question=payload.question,
+        generated_answer=answer_text,
+        reference_answer=payload.reference_answer,
+        required_facts=payload.required_facts,
+        expected_doc_ids=payload.expected_doc_ids,
+        evidence_texts=evidence_texts,
+        cited_doc_ids=cited_doc_ids,
+        embedding_model_name=settings.embedding_model_name,
+    )
+
+    response = EvaluateResponse(
+        question=payload.question,
+        answer=answer_text,
+        sub_questions=sub_questions,
+        overall_score=metrics.overall_score,
+        correctness_score=metrics.correctness_score,
+        faithfulness_score=metrics.faithfulness_score,
+        fact_coverage_score=metrics.fact_coverage_score,
+        citation_recall_score=metrics.citation_recall_score,
+        missing_facts=metrics.missing_facts,
+        unsupported_sentences=metrics.unsupported_sentences,
+        citations=list(citation_map.values()),
+    )
+    trace_client.capture(
+        name="evaluate",
+        input_payload=payload.model_dump(),
+        output_payload={
+            "overall_score": response.overall_score,
+            "fact_coverage_score": response.fact_coverage_score,
+            "faithfulness_score": response.faithfulness_score,
         },
         metadata={"vector_store_dir": settings.vector_store_dir},
     )

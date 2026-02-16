@@ -223,6 +223,59 @@ curl -X POST http://127.0.0.1:8000/answer \
   }'
 ```
 
+## Evaluate Answer Quality (HTTP)
+
+Use `/evaluate` with labeled references to measure answer quality directly.
+
+```bash
+curl -X POST http://127.0.0.1:8000/evaluate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "question": "What are dangerous medical conditions and risk factors?",
+    "reference_answer": "Sepsis and hypertensive crisis are high-risk conditions. Delayed diagnosis is a major risk factor.",
+    "required_facts": [
+      "sepsis is a dangerous condition",
+      "delayed diagnosis is a risk factor"
+    ],
+    "expected_doc_ids": ["1234.5678"]
+  }'
+```
+
+Scoring dimensions returned:
+
+- `correctness_score`: semantic match to reference answer
+- `faithfulness_score`: how well answer statements are supported by retrieved evidence
+- `fact_coverage_score`: required fact coverage ratio
+- `citation_recall_score`: expected source coverage in cited doc IDs
+- `overall_score`: weighted aggregate of the above metrics
+
+Evaluation logic details:
+
+1. The system generates an answer using the same production flow:
+   - question decomposition
+   - per-subquestion retrieval
+   - evidence-grounded composition
+2. It then computes four quality signals:
+   - `correctness_score`: embedding similarity between generated answer and `reference_answer`
+   - `fact_coverage_score`: fraction of `required_facts` semantically matched in answer sentences
+   - `faithfulness_score`: fraction of factual answer sentences supported by retrieved evidence sentences
+   - `citation_recall_score`: overlap between `expected_doc_ids` and cited document IDs
+3. Final score formula:
+
+```text
+overall_score =
+  0.35 * correctness_score +
+  0.30 * fact_coverage_score +
+  0.20 * faithfulness_score +
+  0.15 * citation_recall_score
+```
+
+Metric ranges:
+
+- All scores are normalized to `[0, 1]`
+- Higher is better
+- `missing_facts` and `unsupported_sentences` provide actionable error analysis
+
 ## Health and Readiness
 
 ```bash
@@ -236,6 +289,12 @@ Build and run app only:
 
 ```bash
 docker compose up --build
+```
+
+Auto-restart app container when code changes:
+
+```bash
+docker compose up --build --watch
 ```
 
 Run app + Langfuse observability stack:

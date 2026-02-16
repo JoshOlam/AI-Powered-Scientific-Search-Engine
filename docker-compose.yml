@@ -9,6 +9,22 @@ services:
       - "${API_PORT:-8000}:8000"
     volumes:
       - ./data:/app/data
+    command: uv run uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    develop:
+      watch:
+        - action: sync+restart
+          path: ./app
+          target: /app/app
+        - action: sync+restart
+          path: ./main.py
+          target: /app/main.py
+        - action: rebuild
+          path: ./pyproject.toml
+        - action: rebuild
+          path: ./uv.lock
+        - action: sync+restart
+          path: ./.env
+          target: /app/.env
     restart: unless-stopped
 
   langfuse-db:

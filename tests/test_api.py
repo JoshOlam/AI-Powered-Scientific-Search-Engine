@@ -1,6 +1,7 @@
 from fastapi.testclient import TestClient
 
 from app.api import app
+from app.evaluation import EvaluationResult
 from app.miner import RawDocument
 
 
@@ -143,4 +144,46 @@ def test_answer_endpoint(monkeypatch):
     assert len(body["sub_questions"]) >= 1
     assert len(body["steps"]) >= 1
     assert "Answer based on indexed documents" in body["answer"]
+    assert len(body["citations"]) >= 1
+
+
+def test_evaluate_endpoint(monkeypatch):
+    from app import api
+
+    class FakeVectorStore:
+        @classmethod
+        def load(cls, path: str):
+            return DummyStore()
+
+    def fake_evaluate_answer_quality(**kwargs):
+        return EvaluationResult(
+            overall_score=0.88,
+            correctness_score=0.9,
+            faithfulness_score=0.85,
+            fact_coverage_score=0.92,
+            citation_recall_score=0.8,
+            missing_facts=[],
+            unsupported_sentences=[],
+            retrieved_doc_ids=["1234.5678"],
+        )
+
+    monkeypatch.setattr(api, "get_vector_store_class", lambda: FakeVectorStore)
+    monkeypatch.setattr(api, "evaluate_answer_quality", fake_evaluate_answer_quality)
+
+    client = TestClient(app)
+    response = client.post(
+        "/evaluate",
+        json={
+            "question": "What are dangerous conditions and risk factors?",
+            "reference_answer": "Serious conditions include sepsis; risk factors include delayed diagnosis.",
+            "required_facts": ["sepsis is dangerous", "delayed diagnosis is a risk factor"],
+            "expected_doc_ids": ["1234.5678"],
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["overall_score"] == 0.88
+    assert body["fact_coverage_score"] == 0.92
+    assert len(body["sub_questions"]) >= 1
     assert len(body["citations"]) >= 1
