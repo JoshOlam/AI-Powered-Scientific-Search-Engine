@@ -132,12 +132,17 @@ def fetch_pubmed_docs(topic: str, max_docs: int = 4, timeout: int = 20) -> List[
     return docs
 
 
-def mine_documents(topic: str, arxiv_docs: int = 8, pubmed_docs: int = 0) -> List[RawDocument]:
+def mine_documents(
+    topic: str,
+    arxiv_docs: int = 8,
+    pubmed_docs: int = 0,
+    timeout: int = 30,
+) -> List[RawDocument]:
     docs: List[RawDocument] = []
     if arxiv_docs > 0:
-        docs.extend(fetch_arxiv_docs(topic=topic, max_docs=arxiv_docs))
+        docs.extend(fetch_arxiv_docs(topic=topic, max_docs=arxiv_docs, timeout=timeout))
     if pubmed_docs > 0:
-        docs.extend(fetch_pubmed_docs(topic=topic, max_docs=pubmed_docs))
+        docs.extend(fetch_pubmed_docs(topic=topic, max_docs=pubmed_docs, timeout=timeout))
     if not docs:
         raise RuntimeError("No documents were mined from ArXiv/PubMed for the given topic.")
     return docs
